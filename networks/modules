@@ -1,0 +1,225 @@
+-----------------------SDEM-------------------------
+class FusionModule(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.d_conv = nn.Conv2d(in_channels*2, in_channels, kernel_size=1)
+        self.att = Attention(in_channels)
+
+        # texture conv
+        self.t_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, dilation=1)
+        self.t_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=3, dilation=3)
+        self.t_conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=5, dilation=5)
+
+        self.m_conv1 = nn.Conv2d(in_channels*3, in_channels*3 // 8, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.m_conv2 = nn.Conv2d(in_channels*3 // 8, in_channels*3, kernel_size=1)
+
+
+    def forward(self, x1, x2):
+
+        cat_feature = torch.cat([x1, x2], dim=1)
+        d_score = self.d_conv(cat_feature)
+        diff = d_score
+
+        # multi-scale texture feature local
+        t_d_1 = self.t_conv1(diff)
+        t_d_2 = self.t_conv2(diff)
+        t_d_3 = self.t_conv3(diff)
+
+        t_d = torch.cat([t_d_1, t_d_2, t_d_3], dim=1) #(B, C*3, H, W)
+        t_d_res = t_d.clone()
+
+        m_t_d = self.m_conv1(t_d)
+        m_t_d = self.relu(m_t_d)
+        m_t_d = self.m_conv2(m_t_d)
+        m_t_d = torch.sigmoid(m_t_d)
+
+        t_d = t_d_res * m_t_d
+
+        # split and sum operation
+        t_d_1 = t_d[:, :t_d.shape[1]//3, :, :]
+        t_d_2 = t_d[:, t_d.shape[1]//3:t_d.shape[1]//3*2, :, :]
+        t_d_3 = t_d[:, t_d.shape[1]//3*2:, :, :]
+
+        mt_d = t_d_1 + t_d_2 + t_d_3
+
+        # out = d_score * g_diff + mt_d * (1 - d_score)
+        out = mt_d
+        return out
+-----------------------CSFM-------------------------
+def channel_shuffle(x, groups=2):
+    bat_size, channels, w, h = x.shape
+    group_c = channels // groups
+    x = x.view(bat_size, groups, group_c, w, h)
+    x = torch.transpose(x, 1, 2).contiguous()
+    x = x.view(bat_size, -1, w, h)
+    return x
+
+class ShuffleBlock(nn.Module):
+    def __init__(self, in_c, out_c, downsample=False):
+        super(ShuffleBlock, self).__init__()
+        self.downsample = downsample
+        half_c = out_c // 2
+        if downsample:
+            self.branch1 = nn.Sequential(
+                # 3*3 dw conv, stride = 2
+                nn.Conv2d(in_c, in_c, 3, 2, 1, groups=in_c, bias=False),
+                nn.BatchNorm2d(in_c),
+                # 1*1 pw conv
+                nn.Conv2d(in_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True)
+            )
+
+            self.branch2 = nn.Sequential(
+                # 1*1 pw conv
+                nn.Conv2d(in_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True),
+                # 3*3 dw conv, stride = 2
+                nn.Conv2d(half_c, half_c, 3, 2, 1, groups=half_c, bias=False),
+                nn.BatchNorm2d(half_c),
+                # 1*1 pw conv
+                nn.Conv2d(half_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True)
+            )
+
+        else:
+            # in_c = out_c
+            assert in_c == out_c
+
+            self.branch2 = nn.Sequential(
+                # 1*1 pw conv
+                nn.Conv2d(half_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True),
+                # 3*3 dw conv, stride = 1
+                nn.Conv2d(half_c, half_c, 3, 1, 1, groups=half_c, bias=False),
+                nn.BatchNorm2d(half_c),
+                # 1*1 pw conv
+                nn.Conv2d(half_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True)
+            )
+            self.branch2_dsm = nn.Sequential(
+                # 1*1 pw conv
+                nn.Conv2d(half_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True),
+                # 3*3 dw conv, stride = 1
+                nn.Conv2d(half_c, half_c, 3, 1, 1, groups=half_c, bias=False),
+                nn.BatchNorm2d(half_c),
+                # 1*1 pw conv
+                nn.Conv2d(half_c, half_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(half_c),
+                nn.ReLU(True)
+            )
+
+    def forward(self, x,y):
+        out = None
+        if self.downsample:
+            # if it is downsampling, we don't need to do channel split
+            out = torch.cat((self.branch1(x), self.branch2(x)), 1)
+        else:
+            # channel split
+            channels = x.shape[1]
+            c = channels // 2
+            x1 = x[:, :c, :, :]
+            x2 = x[:, c:, :, :]
+
+            y1 = y[:, :c, :, :]
+            y2 = y[:, c:, :, :]
+
+            out = torch.cat((x1, self.branch2(y2)), 1)
+            out_rgb = channel_shuffle(out, 2)
+
+            out_dsm = torch.cat((y1, self.branch2_dsm(x2)), 1)
+            out = channel_shuffle(out, 2)
+            out_dsm = channel_shuffle(out_dsm, 2)
+
+        return out_rgb, out_dsm
+
+class TimeAttention(nn.Module):
+    def __init__(self,
+                 channels):
+        super(TimeAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        attn_channels = channels // 16  # 计算注意力通道数
+        attn_channels = max(attn_channels, 8)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels * 2, attn_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(attn_channels),
+            nn.ReLU(),
+            nn.Conv2d(attn_channels, channels * 2, kernel_size=1, bias=False),
+        )
+
+    def forward(self, x1, x2):
+        # 形状都是 (B, C, H, W)
+        x = torch.cat((x1, x2), dim=1)
+        x = self.avg_pool(x)  # (B, 2*C, 1, 1)
+        y = self.mlp(x)
+        B, C, H, W = y.size()
+        x1_attn, x2_attn = y.reshape(B, 2, C // 2, H, W).transpose(0, 1)
+        # 分组，打乱，类似shuffle
+        # x1_attn：与 x1 相关的注意力权重。
+        # x2_attn：与 x2 相关的注意力权重。
+        x1_attn = torch.sigmoid(x1_attn)
+        x2_attn = torch.sigmoid(x2_attn)
+        x1 = x1 * x1_attn + x1
+        x2 = x2 * x2_attn + x2
+        return x1, x2
+-----------------------D  S-------------------------
+def train(net, optimizer, epochs, scheduler=None, weights=WEIGHTS, save_epoch=1,log_file=log_file,save_dir=dir):
+    losses = np.zeros(1000000)
+    mean_losses = np.zeros(100000000)
+    weights = weights.cuda()
+
+    criterion = nn.NLLLoss2d(weight=weights)
+    iter_ = 0
+    acc_best = 50.0
+
+    for e in range(1, epochs + 1):
+        if scheduler is not None:
+            scheduler.step()
+        net.train()
+        for batch_idx, (data, dsm, target) in enumerate(train_loader):
+            data, dsm, target = Variable(data.cuda()), Variable(dsm.cuda()), Variable(target.cuda())
+            optimizer.zero_grad()
+
+            # 维度1添加一个维度
+            dsm = dsm.unsqueeze(1)
+
+            output,out_seg_1,out_seg_2,out_seg_3,out_seg_4 = net(data, dsm)
+            # gen multi-scale target
+            target_1 = F.interpolate(target.unsqueeze(1).float(), size=out_seg_1.shape[2:], mode='nearest').squeeze(1).long()
+            target_2 = F.interpolate(target.unsqueeze(1).float(), size=out_seg_2.shape[2:], mode='nearest').squeeze(1).long()
+            target_3 = F.interpolate(target.unsqueeze(1).float(), size=out_seg_3.shape[2:], mode='nearest').squeeze(1).long()
+            target_4 = F.interpolate(target.unsqueeze(1).float(), size=out_seg_4.shape[2:], mode='nearest').squeeze(1).long()
+            # output = net(data)
+            loss = CrossEntropy2d(output, target, weight=weights)
+            loss_1 = CrossEntropy2d(out_seg_1, target_1, weight=weights)
+            loss_2 = CrossEntropy2d(out_seg_2, target_2, weight=weights)
+            loss_3 = CrossEntropy2d(out_seg_3, target_3, weight=weights)
+            loss_4 = CrossEntropy2d(out_seg_4, target_4, weight=weights)
+            loss = loss * 0.8 + (loss_1 + loss_2 + loss_3 + loss_4) * 0.2
+            # dice loss
+            # print(f"Output shape: {output.shape}, Target shape: {target.shape}")
+            loss_dice = dice_loss_fn(output, target)
+            loss_dice_1 = dice_loss_fn(out_seg_1, target_1)
+            loss_dice_2 = dice_loss_fn(out_seg_2, target_2)
+            loss_dice_3 = dice_loss_fn(out_seg_3, target_3)
+            loss_dice_4 = dice_loss_fn(out_seg_4, target_4)
+            loss_dice = loss_dice * 0.8 + (loss_dice_1 + loss_dice_2 + loss_dice_3 + loss_dice_4) * 0.2
+
+            # focal loss
+            loss_focal = focal_loss_fn(output, target)
+            loss_focal_1 = focal_loss_fn(out_seg_1, target_1)
+            loss_focal_2 = focal_loss_fn(out_seg_2, target_2)
+            loss_focal_3 = focal_loss_fn(out_seg_3, target_3)
+            loss_focal_4 = focal_loss_fn(out_seg_4, target_4)
+            loss_focal = loss_focal * 0.8 + (loss_focal_1 + loss_focal_2 + loss_focal_3 + loss_focal_4) * 0.2
+
+            loss = loss + loss_dice + loss_focal
+
+            loss.backward()
